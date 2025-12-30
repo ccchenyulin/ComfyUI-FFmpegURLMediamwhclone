@@ -50,7 +50,7 @@ git clone https://github.com/hhayiyuan/ComfyUI-FFmpegURLMedia.git
 
 **作用：从网络URL加载视频文件**
 
-![FFmpeg Video URL节点截图](screenshots/video_url_node.png)
+![FFmpeg Video URL节点截图](images/image.png)
 
 ##### 参数说明
 
@@ -71,7 +71,7 @@ git clone https://github.com/hhayiyuan/ComfyUI-FFmpegURLMedia.git
 
 **作用：从网络URL加载音频文件**
 
-![FFmpeg Audio URL节点截图](screenshots/audio_url_node.png)
+![FFmpeg Audio URL节点截图](images/image-1.png)
 
 ##### 参数说明
 
@@ -94,7 +94,7 @@ git clone https://github.com/hhayiyuan/ComfyUI-FFmpegURLMedia.git
 
 **作用：从网络URL加载图像文件**
 
-![FFmpeg Image URL节点截图](screenshots/image_url_node.png)
+![FFmpeg Image URL节点截图](images/image-2.png)
 
 ##### 参数说明
 
@@ -117,7 +117,7 @@ git clone https://github.com/hhayiyuan/ComfyUI-FFmpegURLMedia.git
 
 这是本插件**最核心的节点**，支持多种合并模式。
 
-![FFmpeg Media Merge节点截图](screenshots/media_merge_node.png)
+![FFmpeg Media Merge节点截图](images/image-3.png)
 
 ##### 参数说明
 
@@ -164,7 +164,7 @@ git clone https://github.com/hhayiyuan/ComfyUI-FFmpegURLMedia.git
 
 相比Media Merge节点提供了更精细的控制，特别是**音频循环**功能。
 
-![FFmpeg Single AV Merge节点截图](screenshots/single_av_merge_node.png)
+![FFmpeg Single AV Merge节点截图](images/image-4.png)
 
 ##### 参数说明
 
