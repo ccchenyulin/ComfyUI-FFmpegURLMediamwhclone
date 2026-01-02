@@ -16,13 +16,16 @@
 
 ## 说明
 
-使用该节点**不需要手动安装FFmpeg**，插件首次运行时会**自动下载**FFmpeg到插件目录。
+使用该节点**不需要手动安装 FFmpeg**！
 
-如果自动下载失败，可以手动下载FFmpeg并放置到 `ComfyUI/custom_nodes/ComfyUI-FFmpeg-VideoMerge/bin/` 目录下。
+插件通过 `imageio-ffmpeg` Python 包自动管理 FFmpeg，安装依赖时会自动下载：
 
-### Security / Offline Notes
-- Set `FFMPEG_DOWNLOAD_SHA256` to verify the auto-downloaded archive.
-- Set `FFMPEG_SKIP_DOWNLOAD=1` to disable auto-download and use system FFmpeg or place it in `bin/`.
+```bash
+pip install -r requirements.txt
+```
+
+如果 `imageio-ffmpeg` 不可用，插件会尝试使用系统已安装的 FFmpeg。
+
 
 ---
 
