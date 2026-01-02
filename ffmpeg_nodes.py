@@ -7,6 +7,8 @@ import tempfile
 import uuid
 import folder_paths
 from .ffmpeg_utils import ensure_ffmpeg
+import atexit
+import time
 
 # Try to import ComfyUI's native VIDEO type for compatibility
 try:
@@ -19,6 +21,55 @@ except ImportError:
     except ImportError:
         HAS_VIDEO_TYPE = False
         VideoFromFile = None
+
+
+# Global temp file tracker for cleanup on exit
+_temp_files_to_cleanup = set()
+_TEMP_CLEANUP_PREFIXES = (
+    "ffmpeg_url_video_",
+    "ffmpeg_url_audio_",
+    "ffmpeg_audio_",
+    "ffmpeg_merge_temp_",
+    "ffmpeg_merge_video_",
+    "ffmpeg_merge_audio_",
+)
+_TEMP_CLEANUP_MAX_AGE_SECONDS = int(os.environ.get("FFMPEG_TEMP_MAX_AGE_SECONDS", "86400"))
+
+def _register_temp_file(path):
+    """Register a temp file for cleanup on exit"""
+    _temp_files_to_cleanup.add(path)
+
+def _cleanup_temp_files_on_exit():
+    """Cleanup all registered temp files on program exit"""
+    for path in list(_temp_files_to_cleanup):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+    _temp_files_to_cleanup.clear()
+
+
+def _cleanup_stale_temp_files():
+    """Cleanup stale temp files to avoid unbounded growth."""
+    temp_dir = folder_paths.get_temp_directory()
+    now = time.time()
+    try:
+        for name in os.listdir(temp_dir):
+            if not name.startswith(_TEMP_CLEANUP_PREFIXES):
+                continue
+            path = os.path.join(temp_dir, name)
+            try:
+                if now - os.path.getmtime(path) > _TEMP_CLEANUP_MAX_AGE_SECONDS:
+                    os.remove(path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_temp_files_on_exit)
+_cleanup_stale_temp_files()
 
 
 class FFmpeg_LoadVideoFromURL_JX:
@@ -70,6 +121,9 @@ class FFmpeg_LoadVideoFromURL_JX:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             
+            # Register for cleanup on exit
+            _register_temp_file(temp_path)
+            
             # Return VideoFromFile if available, otherwise return path
             if HAS_VIDEO_TYPE and VideoFromFile is not None:
                 return (VideoFromFile(temp_path),)
@@ -78,8 +132,7 @@ class FFmpeg_LoadVideoFromURL_JX:
                 
         except Exception as e:
             print(f"[FFmpeg] Failed to download video from URL: {e}")
-            # Fallback to URL string for our own nodes
-            return (url,)
+            raise RuntimeError(f"Failed to download video from URL: {e}")
 
 class FFmpeg_LoadAudioFromURL_JX:
     """Load audio from URL"""
@@ -135,6 +188,10 @@ class FFmpeg_LoadAudioFromURL_JX:
             ffmpeg_path = ensure_ffmpeg()
             wav_path = os.path.join(self.temp_dir, f"ffmpeg_url_audio_{uuid.uuid4().hex[:8]}.wav")
             
+            # Register temp files for cleanup
+            _register_temp_file(temp_path)
+            _register_temp_file(wav_path)
+            
             cmd = [
                 ffmpeg_path, "-y",
                 "-i", temp_path,
@@ -147,10 +204,13 @@ class FFmpeg_LoadAudioFromURL_JX:
             
             if result.returncode != 0:
                 print(f"[FFmpeg] FFmpeg conversion failed: {result.stderr}")
-                # Try returning path as fallback for our own nodes
-                return (temp_path,)
+                raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
             
-            # Load audio using torchaudio
+            # Load audio using torchaudio (preferred) or fallback methods
+            waveform = None
+            sample_rate = 44100
+            
+            # Method 1: Try torchaudio (preferred)
             try:
                 import torchaudio
                 waveform, sample_rate = torchaudio.load(wav_path)
@@ -158,22 +218,90 @@ class FFmpeg_LoadAudioFromURL_JX:
                 # Add batch dimension if needed [B, C, S]
                 if len(waveform.shape) == 2:
                     waveform = waveform.unsqueeze(0)
-                
-                # Return ComfyUI standard AUDIO format
-                audio_output = {
-                    "waveform": waveform,
-                    "sample_rate": sample_rate
-                }
-                return (audio_output,)
-                
+                    
             except ImportError:
-                print("[FFmpeg] torchaudio not available, returning file path")
-                return (wav_path,)
+                print("[FFmpeg] torchaudio not available, trying fallback methods...")
+            except Exception as e:
+                print(f"[FFmpeg] torchaudio load failed: {e}, trying fallback methods...")
+            
+            # Method 2: Try scipy.io.wavfile
+            if waveform is None:
+                try:
+                    from scipy.io import wavfile
+                    sample_rate, audio_data = wavfile.read(wav_path)
+                    import numpy as np
+                    
+                    # Normalize to float32 [-1, 1]
+                    if audio_data.dtype == np.int16:
+                        audio_data = audio_data.astype(np.float32) / 32768.0
+                    elif audio_data.dtype == np.int32:
+                        audio_data = audio_data.astype(np.float32) / 2147483648.0
+                    elif audio_data.dtype == np.uint8:
+                        audio_data = (audio_data.astype(np.float32) - 128) / 128.0
+                    
+                    # Handle mono vs stereo
+                    if len(audio_data.shape) == 1:
+                        audio_data = audio_data.reshape(1, -1)  # [C, S]
+                    else:
+                        audio_data = audio_data.T  # [S, C] -> [C, S]
+                    
+                    waveform = torch.from_numpy(audio_data).unsqueeze(0)  # [1, C, S]
+                    print("[FFmpeg] Loaded audio using scipy.io.wavfile")
+                    
+                except ImportError:
+                    print("[FFmpeg] scipy not available, trying manual WAV parsing...")
+                except Exception as e:
+                    print(f"[FFmpeg] scipy load failed: {e}, trying manual WAV parsing...")
+            
+            # Method 3: Manual WAV parsing (basic fallback)
+            if waveform is None:
+                try:
+                    import wave
+                    import numpy as np
+                    
+                    with wave.open(wav_path, 'rb') as wav_file:
+                        n_channels = wav_file.getnchannels()
+                        sample_width = wav_file.getsampwidth()
+                        sample_rate = wav_file.getframerate()
+                        n_frames = wav_file.getnframes()
+                        
+                        raw_data = wav_file.readframes(n_frames)
+                        
+                        # Convert bytes to numpy array
+                        if sample_width == 2:
+                            audio_data = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+                        elif sample_width == 1:
+                            audio_data = (np.frombuffer(raw_data, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+                        else:
+                            raise ValueError(f"Unsupported sample width: {sample_width}")
+                        
+                        # Reshape for channels
+                        if n_channels > 1:
+                            audio_data = audio_data.reshape(-1, n_channels).T  # [C, S]
+                        else:
+                            audio_data = audio_data.reshape(1, -1)  # [1, S]
+                        
+                        waveform = torch.from_numpy(audio_data).unsqueeze(0)  # [1, C, S]
+                        print("[FFmpeg] Loaded audio using manual WAV parsing")
+                        
+                except Exception as e:
+                    print(f"[FFmpeg] Manual WAV parsing failed: {e}")
+                    raise RuntimeError(
+                        f"Cannot load audio file. Please install torchaudio or scipy:\n"
+                        f"  pip install torchaudio\n"
+                        f"  or: pip install scipy"
+                    )
+            
+            # Return ComfyUI standard AUDIO format
+            audio_output = {
+                "waveform": waveform,
+                "sample_rate": sample_rate
+            }
+            return (audio_output,)
                 
         except Exception as e:
             print(f"[FFmpeg] Failed to download/process audio from URL: {e}")
-            # Fallback to URL string for our own nodes
-            return (url,)
+            raise RuntimeError(f"Failed to download/process audio from URL: {e}")
 
 class FFmpeg_LoadImageFromURL_JX:
     """Load image from URL"""
@@ -314,6 +442,32 @@ class FFmpeg_VideoMerge_JX:
     CATEGORY = "video/ffmpeg"
     OUTPUT_NODE = True
 
+    def _has_audio_stream(self, ffmpeg_path, video_path):
+        """Check if video file has an audio stream using ffprobe/ffmpeg"""
+        try:
+            # Try using ffprobe if available (same directory as ffmpeg)
+            ffprobe_path = ffmpeg_path.replace('ffmpeg.exe', 'ffprobe.exe').replace('ffmpeg', 'ffprobe')
+            if not os.path.exists(ffprobe_path):
+                ffprobe_path = 'ffprobe'  # Try system ffprobe
+            
+            cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'a', 
+                   '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return 'audio' in result.stdout
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, "-i", video_path, "-hide_banner"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            return "Audio:" in result.stderr
+        except Exception:
+            return False
     
     def _extract_video_path(self, video_input, index):
         """Extract video file path from various input formats, save to temp file if needed"""
@@ -547,6 +701,29 @@ class FFmpeg_VideoMerge_JX:
     
     def _merge_audios_only(self, ffmpeg_path, audios, output_path):
         """Merge multiple audios by concatenation"""
+        # Check if any audio is a URL - concat demuxer doesn't support URLs
+        has_url = any(a.startswith(('http://', 'https://')) for a in audios)
+        
+        if has_url:
+            # Use filter_complex method for URLs
+            cmd = [ffmpeg_path, "-y"]
+            for audio in audios:
+                cmd.extend(["-i", audio])
+            
+            # Build concat filter
+            filter_parts = []
+            for i in range(len(audios)):
+                filter_parts.append(f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a{i}];")
+            streams = "".join([f"[a{i}]" for i in range(len(audios))])
+            filter_str = "".join(filter_parts) + f"{streams}concat=n={len(audios)}:v=0:a=1[aout]"
+            
+            cmd.extend(["-filter_complex", filter_str, "-map", "[aout]", "-c:a", "aac", output_path])
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"FFmpeg error: {result.stderr}")
+            return
+        
+        # For local files only, use concat demuxer (faster, stream copy)
         list_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
         try:
             for audio in audios:
@@ -578,6 +755,10 @@ class FFmpeg_VideoMerge_JX:
         # Add audio inputs
         for audio in audios:
             cmd.extend(["-i", audio])
+
+        if audio_mode == "mix" and not self._has_audio_stream(ffmpeg_path, video_path):
+            print("[FFmpeg] Warning: video has no audio, falling back to replace mode.")
+            audio_mode = "replace"
         
         # Build filter based on mode
         if audio_mode == "replace":
@@ -638,7 +819,13 @@ class FFmpeg_VideoMerge_JX:
         
         n_videos = len(videos)
         n_audios = len(audios)
-        
+
+        if audio_mode == "mix":
+            has_all_audio = all(self._has_audio_stream(ffmpeg_path, v) for v in videos)
+            if not has_all_audio:
+                print("[FFmpeg] Warning: one or more videos have no audio, using external audio only.")
+                audio_mode = "replace"
+
         # Normalize resolution, fps, and pixel format
         target_w = 1080
         target_h = 1920
@@ -647,13 +834,15 @@ class FFmpeg_VideoMerge_JX:
         filter_parts = []
         
         # Process each video: scale, pad, fps, format
+        # Also handle videos without audio by generating silent audio
         for i in range(n_videos):
             filter_parts.append(
                 f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                 f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
                 f"fps={target_fps},format=yuv420p,setsar=1[v{i}];"
             )
-            # Normalize video's original audio with volume control (only needed for mix mode)
+            # For mix mode: normalize video's original audio with volume control
+            # Use anullsrc as fallback if video has no audio stream
             if audio_mode == "mix":
                 filter_parts.append(
                     f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume={video_volume}[va{i}];"
@@ -731,6 +920,28 @@ class FFmpeg_VideoMerge_JX:
             except:
                 pass
         self.temp_files = []
+
+    def _download_url_to_temp(self, url, media_type):
+        """Download a URL to a temp file and return its local path."""
+        import requests
+
+        default_ext = ".mp4" if media_type == "video" else ".wav"
+        ext = os.path.splitext(url.split("?")[0])[-1] or default_ext
+        if media_type == "video":
+            prefix = "ffmpeg_merge_video_"
+        else:
+            prefix = "ffmpeg_merge_audio_"
+        temp_path = os.path.join(self.temp_dir, f"{prefix}{uuid.uuid4().hex[:8]}{ext}")
+
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        with open(temp_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=8192):
+                handle.write(chunk)
+
+        self.temp_files.append(temp_path)
+        _register_temp_file(temp_path)
+        return temp_path
     
     def _build_filter_command(self, ffmpeg_path, videos, output_path):
         """Build re-encode command with resolution normalization.
@@ -753,6 +964,7 @@ class FFmpeg_VideoMerge_JX:
         target_fps = 30
         
         filter_parts = []
+        include_audio = all(self._has_audio_stream(ffmpeg_path, v) for v in videos)
         
         # For each video: scale to fit, pad to exact size, set fps and pixel format
         # Also handle audio: if no audio, create silent audio
@@ -763,26 +975,31 @@ class FFmpeg_VideoMerge_JX:
                 f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
                 f"fps={target_fps},format=yuv420p,setsar=1[v{i}];"
             )
-            # Audio processing: normalize and handle missing audio
-            filter_parts.append(
-                f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a{i}];"
-            )
+            # Audio processing: only when all inputs have audio streams
+            if include_audio:
+                filter_parts.append(
+                    f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a{i}];"
+                )
         
-        # Concat all normalized streams
-        # Concat expects alternating streams: [v0][a0][v1][a1]...
-        interleaved = "".join([f"[v{i}][a{i}]" for i in range(n)])
-        filter_parts.append(f"{interleaved}concat=n={n}:v=1:a=1[outv][outa]")
+        if include_audio:
+            # Concat expects alternating streams: [v0][a0][v1][a1]...
+            interleaved = "".join([f"[v{i}][a{i}]" for i in range(n)])
+            filter_parts.append(f"{interleaved}concat=n={n}:v=1:a=1[outv][outa]")
+        else:
+            print("[FFmpeg] Warning: one or more videos have no audio, output will be video-only.")
+            interleaved = "".join([f"[v{i}]" for i in range(n)])
+            filter_parts.append(f"{interleaved}concat=n={n}:v=1:a=0[outv]")
         
         filter_str = "".join(filter_parts)
         
+        cmd.extend(["-filter_complex", filter_str, "-map", "[outv]"])
+        if include_audio:
+            cmd.extend(["-map", "[outa]", "-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd.append("-an")
         cmd.extend([
-            "-filter_complex", filter_str,
-            "-map", "[outv]",
-            "-map", "[outa]",
             "-c:v", "libx264",
             "-preset", "fast",
-            "-c:a", "aac",
-            "-b:a", "192k",
             output_path
         ])
         
@@ -976,10 +1193,16 @@ class FFmpeg_VideoAudioMerge_JX:
     
     def _merge_videos(self, ffmpeg_path, video_paths, output_path):
         """mergemultiple video"""
+        local_paths = []
+        for video in video_paths:
+            if isinstance(video, str) and video.startswith(("http://", "https://")):
+                local_paths.append(self._download_url_to_temp(video, "video"))
+            else:
+                local_paths.append(video)
         
         list_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
         try:
-            for video in video_paths:
+            for video in local_paths:
                 abs_path = os.path.abspath(video).replace("\\", "/")
                 list_file.write(f"file '{abs_path}'\n")
             list_file.close()
@@ -999,10 +1222,10 @@ class FFmpeg_VideoAudioMerge_JX:
             if result.returncode != 0:
                 # try re-encoding
                 cmd = [ffmpeg_path, "-y"]
-                for video in video_paths:
+                for video in local_paths:
                     cmd.extend(["-i", video])
                 
-                n = len(video_paths)
+                n = len(local_paths)
                 filter_parts = []
                 for i in range(n):
                     filter_parts.append(f"[{i}:v:0]")
@@ -1025,10 +1248,16 @@ class FFmpeg_VideoAudioMerge_JX:
     
     def _merge_audios(self, ffmpeg_path, audio_paths, output_path):
         """mergemultiple audio（concat）"""
+        local_paths = []
+        for audio in audio_paths:
+            if isinstance(audio, str) and audio.startswith(("http://", "https://")):
+                local_paths.append(self._download_url_to_temp(audio, "audio"))
+            else:
+                local_paths.append(audio)
         
         list_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
         try:
-            for audio in audio_paths:
+            for audio in local_paths:
                 abs_path = os.path.abspath(audio).replace("\\", "/")
                 list_file.write(f"file '{abs_path}'\n")
             list_file.close()
@@ -1048,10 +1277,10 @@ class FFmpeg_VideoAudioMerge_JX:
             if result.returncode != 0:
                 # tryusing filter_complex merge
                 cmd = [ffmpeg_path, "-y"]
-                for audio in audio_paths:
+                for audio in local_paths:
                     cmd.extend(["-i", audio])
                 
-                n = len(audio_paths)
+                n = len(local_paths)
                 filter_parts = []
                 for i in range(n):
                     filter_parts.append(f"[{i}:a]")

@@ -20,6 +20,10 @@
 
 如果自动下载失败，可以手动下载FFmpeg并放置到 `ComfyUI/custom_nodes/ComfyUI-FFmpeg-VideoMerge/bin/` 目录下。
 
+### Security / Offline Notes
+- Set `FFMPEG_DOWNLOAD_SHA256` to verify the auto-downloaded archive.
+- Set `FFMPEG_SKIP_DOWNLOAD=1` to disable auto-download and use system FFmpeg or place it in `bin/`.
+
 ---
 
 ## 安装

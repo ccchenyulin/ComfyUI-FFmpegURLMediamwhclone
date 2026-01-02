@@ -1,104 +1,129 @@
 """
-FFmpeg Utilities - 自动下载和管理 FFmpeg
+FFmpeg Utilities - 简化版，使用 imageio-ffmpeg 包
 """
 import os
+import subprocess
 import sys
-import zipfile
-import urllib.request
-import shutil
-import time
 
-def get_ffmpeg_path():
-    """获取 FFmpeg 可执行文件路径"""
+
+def ensure_ffmpeg():
+    """确保 FFmpeg 可用
+    
+    优先级:
+    1. imageio-ffmpeg 包提供的 FFmpeg
+    2. 系统 PATH 中的 FFmpeg
+    3. 本地 bin/ 目录中的 FFmpeg
+    
+    Returns:
+        str: FFmpeg 可执行文件路径
+        
+    Raises:
+        RuntimeError: 如果找不到 FFmpeg
+    """
+    # 方法1: 尝试使用 imageio-ffmpeg (推荐)
+    try:
+        import imageio_ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_path and os.path.exists(ffmpeg_path):
+            return ffmpeg_path
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[FFmpeg Utils] imageio-ffmpeg error: {e}")
+    
+    # 方法2: 检查系统 PATH 中的 FFmpeg
+    system_ffmpeg = _find_system_ffmpeg()
+    if system_ffmpeg:
+        return system_ffmpeg
+    
+    # 方法3: 检查本地 bin 目录
+    local_ffmpeg = _get_local_ffmpeg_path()
+    if os.path.exists(local_ffmpeg):
+        return local_ffmpeg
+    
+    # 都没找到，报错
+    raise RuntimeError(
+        "FFmpeg not found. Please install it using one of these methods:\n\n"
+        "Method 1 (Recommended) - Install imageio-ffmpeg:\n"
+        "  pip install imageio-ffmpeg\n\n"
+        "Method 2 - Install system FFmpeg:\n"
+        "  Windows: Download from https://ffmpeg.org/download.html\n"
+        "  Linux: sudo apt install ffmpeg\n"
+        "  macOS: brew install ffmpeg"
+    )
+
+
+def _get_local_ffmpeg_path():
+    """获取本地 bin 目录中的 FFmpeg 路径"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(current_dir, "bin")
     
     if sys.platform == "win32":
-        ffmpeg_path = os.path.join(bin_dir, "ffmpeg.exe")
+        return os.path.join(bin_dir, "ffmpeg.exe")
     else:
-        ffmpeg_path = os.path.join(bin_dir, "ffmpeg")
-    
-    return ffmpeg_path
+        return os.path.join(bin_dir, "ffmpeg")
 
-def is_ffmpeg_available():
-    """检查 FFmpeg 是否已下载"""
-    ffmpeg_path = get_ffmpeg_path()
-    return os.path.exists(ffmpeg_path)
 
-def download_ffmpeg():
-    """下载 FFmpeg"""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    bin_dir = os.path.join(current_dir, "bin")
-    os.makedirs(bin_dir, exist_ok=True)
-    
-    if sys.platform != "win32":
-        raise RuntimeError("自动下载仅支持 Windows，请手动安装 FFmpeg")
-    
-    print("[FFmpeg Video Merge] 正在下载 FFmpeg，请稍候...")
-    
-    # 使用 gyan.dev 的 essentials 版本（较小）
-    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    zip_path = os.path.join(bin_dir, "ffmpeg.zip")
-    target_path = os.path.join(bin_dir, "ffmpeg.exe")
-    
-    # 如果已存在旧的zip文件，先尝试删除
-    if os.path.exists(zip_path):
-        try:
-            os.remove(zip_path)
-        except:
-            # 如果删除失败，使用新文件名
-            zip_path = os.path.join(bin_dir, f"ffmpeg_{int(time.time())}.zip")
-    
+def _find_system_ffmpeg():
+    """查找系统 PATH 中的 FFmpeg"""
     try:
-        # 下载文件
-        def report_progress(block_num, block_size, total_size):
-            downloaded = block_num * block_size
-            if total_size > 0:
-                percent = min(100, downloaded * 100 // total_size)
-                print(f"\r[FFmpeg Video Merge] 下载进度: {percent}%", end="", flush=True)
-        
-        urllib.request.urlretrieve(url, zip_path, reporthook=report_progress)
-        print()  # 换行
-        
-        print("[FFmpeg Video Merge] 正在解压...")
-        
-        # 解压并找到 ffmpeg.exe
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for file_info in zip_ref.namelist():
-                if file_info.endswith("bin/ffmpeg.exe"):
-                    # 读取文件内容
-                    data = zip_ref.read(file_info)
-                    # 写入目标文件
-                    with open(target_path, 'wb') as target:
-                        target.write(data)
-                    print(f"[FFmpeg Video Merge] 已提取: {target_path}")
-                    break
-        
-        # 等待一下确保文件句柄释放
-        time.sleep(0.5)
-        
-        # 清理 zip 文件
-        try:
-            os.remove(zip_path)
-        except Exception as e:
-            print(f"[FFmpeg Video Merge] 警告: 无法删除临时文件 {zip_path}: {e}")
-            # 不抛出异常，因为ffmpeg已经解压成功
-        
-        print("[FFmpeg Video Merge] FFmpeg 下载完成！")
-        return True
-        
-    except Exception as e:
-        print(f"[FFmpeg Video Merge] 下载失败: {e}")
-        # 尝试清理
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        except:
-            pass
-        raise RuntimeError(f"FFmpeg 下载失败: {e}")
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["where", "ffmpeg"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            if result.returncode == 0:
+                paths = result.stdout.strip().split('\n')
+                if paths and paths[0]:
+                    return paths[0].strip()
+        else:
+            result = subprocess.run(
+                ["which", "ffmpeg"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    except Exception:
+        pass
+    
+    return None
 
-def ensure_ffmpeg():
-    """确保 FFmpeg 可用，不可用则下载"""
-    if not is_ffmpeg_available():
-        download_ffmpeg()
-    return get_ffmpeg_path()
+
+def get_ffprobe_path(ffmpeg_path=None):
+    """获取 ffprobe 路径 (与 ffmpeg 同目录)"""
+    if ffmpeg_path is None:
+        ffmpeg_path = ensure_ffmpeg()
+    
+    # 尝试从 imageio-ffmpeg 获取
+    try:
+        import imageio_ffmpeg
+        # imageio-ffmpeg 不提供 ffprobe，使用同目录推断
+        pass
+    except ImportError:
+        pass
+    
+    # 推断 ffprobe 路径
+    if sys.platform == "win32":
+        ffprobe_path = ffmpeg_path.replace('ffmpeg.exe', 'ffprobe.exe')
+    else:
+        ffprobe_path = ffmpeg_path.replace('ffmpeg', 'ffprobe')
+    
+    if os.path.exists(ffprobe_path):
+        return ffprobe_path
+    
+    # 尝试系统 ffprobe
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-version"],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            return "ffprobe"
+    except Exception:
+        pass
+    
+    return None
