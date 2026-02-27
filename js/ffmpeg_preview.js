@@ -339,6 +339,33 @@ app.registerExtension({
             // Track expected height for preview
             let expectedHeight = null;
 
+            // 核心修改：新增函数，区分URL和本地路径，适配ComfyUI的/view接口
+            const getMediaSource = (url) => {
+                // 判断是否是网络URL（http/https开头）
+                if (url.startsWith('http://') || url.startsWith('https://')) {
+                    return url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
+                }
+                
+                // 处理本地路径：通过ComfyUI的/view接口加载
+                const filename = url.split(/[\\/]/).pop(); // 提取文件名（如test.mp4）
+                // 先尝试output目录，失败后自动重试temp目录
+                return `/view?filename=${encodeURIComponent(filename)}&type=output&t=${Date.now()}`;
+            };
+
+            // 处理本地路径预览的错误重试（output→temp）
+            const setupMediaErrorRetry = (mediaElement, originalUrl) => {
+                let triedTemp = false;
+                mediaElement.onerror = () => {
+                    if (!triedTemp && !originalUrl.startsWith('http')) {
+                        triedTemp = true;
+                        const filename = originalUrl.split(/[\\/]/).pop();
+                        mediaElement.src = `/view?filename=${encodeURIComponent(filename)}&type=temp&t=${Date.now()}`;
+                    } else {
+                        console.log(`[FFmpeg Preview] Failed to load: ${originalUrl}`);
+                    }
+                };
+            };
+
             const showURLPreview = (url) => {
                 if (!url || !url.trim()) {
                     hideURLPreview();
@@ -360,14 +387,17 @@ app.registerExtension({
                 }
 
                 const container = document.createElement("div");
+                const trimmedUrl = url.trim();
 
                 if (node.comfyClass === "FFmpeg_LoadVideoFromURL_JX") {
                     container.style.cssText = "width:100%;background:#1a1a1a;border-radius:4px;";
                     const video = document.createElement("video");
                     video.controls = true;
                     video.style.cssText = "width:100%;display:block;";
-                    // Add timestamp to prevent caching
-                    video.src = url.trim() + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
+                    // 核心修改：使用适配后的媒体源
+                    video.src = getMediaSource(trimmedUrl);
+                    // 核心修改：添加错误重试逻辑（output→temp）
+                    setupMediaErrorRetry(video, trimmedUrl);
                     video.onloadedmetadata = () => {
                         const aspectRatio = video.videoHeight / video.videoWidth;
                         const nodeWidth = node.size[0] - 20;  // Account for padding
@@ -383,7 +413,9 @@ app.registerExtension({
                     const audio = document.createElement("audio");
                     audio.controls = true;
                     audio.style.cssText = "width:100%;height:25px;";
-                    audio.src = url.trim();
+                    // 适配音频的本地路径加载
+                    audio.src = getMediaSource(trimmedUrl);
+                    setupMediaErrorRetry(audio, trimmedUrl);
                     container.appendChild(audio);
                     node._ffmpegUrlPreview = node.addDOMWidget("ffmpeg_url_preview", "div", container, { serialize: false });
                     expectedHeight = node.computeSize()[1];
@@ -392,7 +424,9 @@ app.registerExtension({
                     container.style.cssText = "width:100%;background:#1a1a1a;border-radius:4px;";
                     const img = document.createElement("img");
                     img.style.cssText = "width:100%;height:auto;display:block;";
-                    img.src = url.trim();
+                    // 适配图片的本地路径加载
+                    img.src = getMediaSource(trimmedUrl);
+                    setupMediaErrorRetry(img, trimmedUrl);
                     img.onload = () => {
                         const aspectRatio = img.naturalHeight / img.naturalWidth;
                         const nodeWidth = node.size[0] - 20;  // Account for padding
